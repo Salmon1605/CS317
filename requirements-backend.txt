@@ -1,0 +1,13 @@
+onnx
+# Use onnxruntime-gpu only when building a CUDA-enabled image.
+onnxruntime
+opencv-python
+numpy
+scikit-image
+matplotlib
+faiss-cpu
+fastapi
+uvicorn
+websockets
+python-multipart
+asyncpg

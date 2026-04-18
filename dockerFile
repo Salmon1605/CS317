@@ -1,0 +1,30 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Native libs required by OpenCV/ONNX runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-backend.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements-backend.txt
+
+COPY . .
+
+EXPOSE 8000
+
+# Default DB URL for docker-compose service name "postgres".
+ENV DATABASE_URL=postgresql://faceid_user:faceid_pass@postgres:5432/faceid_db
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

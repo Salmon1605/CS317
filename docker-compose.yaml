@@ -1,0 +1,37 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: dockerFile
+    container_name: faceid_app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://faceid_user:faceid_pass@postgres:5432/faceid_db
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: faceid_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: faceid_db
+      POSTGRES_USER: faceid_user
+      POSTGRES_PASSWORD: faceid_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faceid_user -d faceid_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local

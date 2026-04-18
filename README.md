@@ -9,6 +9,18 @@ Project source is in [project](project).
 
 ---
 
+## Model checkpoint
+
+- Download model checkpoint and create directory weights/
+  | Model | Link | Dung lượng |
+  |-------|------|-----------|
+  | SCRFD 10G (detection) | [det_10g.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_10g.onnx) | 16.1 MB |
+  | SCRFD 500M (nhẹ) | [det_500m.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_500m.onnx) | 2.4 MB |
+  | ArcFace MobileFace | [w600k_mbf.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_mbf.onnx) | 13 MB |
+  | ArcFace ResNet-50 | [w600k_r50.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx) | 166 MB |
+
+---
+
 ## Method 1: Use [project/start_all.bat](project/start_all.bat)
 
 ### 1) Prepare a venv (one-time setup)

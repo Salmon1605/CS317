@@ -1,4 +1,4 @@
-PyQt6
+gradio
 opencv-python
 numpy
 websockets

@@ -107,6 +107,34 @@ def build_database():
     logger.info("Database built and saved.")
 
 
+def run_inference_on_frame(frame: np.ndarray) -> list[dict]:
+    bboxes, kpss = state.detector.detect(frame, max_num=0)
+    results = []
+    if len(bboxes) == 0:
+        return results
+
+    embeddings, processed_bboxes = [], []
+    for bbox, kps in zip(bboxes, kpss):
+        *bbox_coords, _ = bbox.astype(np.int32)
+        embedding = state.recognizer.get_embedding(frame, kps)
+        embeddings.append(embedding)
+        processed_bboxes.append(bbox_coords)
+
+    if not embeddings:
+        return results
+
+    search_results = state.face_db.batch_search(embeddings, state.similarity_thresh)
+    for bbox, (name, similarity) in zip(processed_bboxes, search_results):
+        results.append(
+            {
+                "bbox": [int(b) for b in bbox],
+                "name": name,
+                "similarity": float(similarity),
+            }
+        )
+    return results
+
+
 async def _apply_db_settings(raw: dict):
     """Apply a dict of string->string settings from DB into AppState."""
     if "det_weight" in raw:
@@ -249,6 +277,28 @@ async def infer_status():
     return {"enabled": state.infer_enabled}
 
 
+@app.post("/api/infer/frame")
+async def infer_frame(image: UploadFile = File(...)):
+    if not state.detector or not state.recognizer or not state.face_db:
+        raise HTTPException(status_code=500, detail="Models not loaded")
+
+    img_bytes = await image.read()
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image data")
+
+    if not state.infer_enabled:
+        return {"results": [], "enabled": False}
+
+    try:
+        return {"results": run_inference_on_frame(frame), "enabled": True}
+    except Exception as e:
+        logger.error(f"Inference error (HTTP frame): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Face database
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -368,26 +418,7 @@ async def websocket_infer(websocket: WebSocket):
                 continue
 
             try:
-                bboxes, kpss = state.detector.detect(frame, max_num=0)
-                results = []
-                if len(bboxes) > 0:
-                    embeddings, processed_bboxes = [], []
-                    for bbox, kps in zip(bboxes, kpss):
-                        *bbox_coords, _ = bbox.astype(np.int32)
-                        embedding = state.recognizer.get_embedding(frame, kps)
-                        embeddings.append(embedding)
-                        processed_bboxes.append(bbox_coords)
-
-                    if embeddings:
-                        search_results = state.face_db.batch_search(embeddings, state.similarity_thresh)
-                        for bbox, (name, similarity) in zip(processed_bboxes, search_results):
-                            results.append({
-                                "bbox": [int(b) for b in bbox],
-                                "name": name,
-                                "similarity": float(similarity),
-                            })
-
-                await websocket.send_json({"results": results})
+                await websocket.send_json({"results": run_inference_on_frame(frame)})
             except Exception as e:
                 logger.error(f"Inference error: {e}")
                 await websocket.send_json({"error": str(e)})

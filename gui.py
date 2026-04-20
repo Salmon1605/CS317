@@ -1,705 +1,801 @@
-import sys
-import os
-import cv2
-import json
-import time
-import asyncio
-import requests
 import datetime
-import threading
-import traceback
-import websockets
+import io
+import json
+import os
+import time
+import atexit
+from dataclasses import dataclass, field
+from typing import Any
+from pathlib import Path
+
+import cv2
+import gradio as gr
 import numpy as np
+import requests
+from websockets.sync.client import connect as ws_connect
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QComboBox, QLineEdit, QFormLayout, QGroupBox, QScrollArea,
-    QFrame, QMessageBox, QSplitter, QDialog, QDialogButtonBox
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QPen
-
-API_BASE_URL = "http://localhost:8000/api"
-WS_URL = "ws://localhost:8000/ws/infer"
+API_BASE_URL = os.getenv("INTERNAL_API_BASE_URL", "http://localhost:8000/api")
+WS_URL = os.getenv("INTERNAL_WS_URL", "ws://localhost:8000/ws/infer")
+FACE_BASE_URL = os.getenv("PUBLIC_FACE_BASE_URL", "http://localhost:8000/faces")
+RUNNING_IN_DOCKER = os.path.exists("/.dockerenv")
+LAST_INFER_ERROR = ""
+WS_CLIENT = None
 
 
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("AI Configuration")
-        self.setMinimumWidth(400)
-        
-        self.layout = QVBoxLayout(self)
-        
-        form_layout = QFormLayout()
-        
-        self.source_input = QLineEdit("0")
-        form_layout.addRow("Video Source:", self.source_input)
-        
-        self.det_combo = QComboBox()
-        self.rec_combo = QComboBox()
-        form_layout.addRow("Detection Model:", self.det_combo)
-        form_layout.addRow("Recognition Model:", self.rec_combo)
-        
-        self.sim_thresh_input = QLineEdit("0.4")
-        form_layout.addRow("Similarity Threshold:", self.sim_thresh_input)
-        
-        self.conf_thresh_input = QLineEdit("0.5")
-        form_layout.addRow("Confidence Threshold:", self.conf_thresh_input)
-        
-        self.unknown_debounce_sec_input = QLineEdit("5")
-        form_layout.addRow("Unknown Debounce (sec):", self.unknown_debounce_sec_input)
-        
-        self.known_debounce_min_input = QLineEdit("5")
-        form_layout.addRow("Known Debounce (min):", self.known_debounce_min_input)
-        
-        self.layout.addLayout(form_layout)
-        
-        # Action Buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        
-        # Update DB Button
-        self.update_db_btn = QPushButton("Force Update DB")
-        self.update_db_btn.clicked.connect(self.force_update_db)
-        self.layout.addWidget(self.update_db_btn)
-        
-        self.layout.addWidget(button_box)
-        
-        self.load_models()
-        self.load_settings()
+def close_ws_client() -> None:
+    global WS_CLIENT
+    if WS_CLIENT is None:
+        return
+    try:
+        WS_CLIENT.close()
+    except Exception:
+        pass
+    WS_CLIENT = None
 
-    def load_models(self):
+
+def get_ws_client():
+    global WS_CLIENT
+    if WS_CLIENT is not None:
+        return WS_CLIENT
+    WS_CLIENT = ws_connect(WS_URL, max_size=8 * 1024 * 1024, open_timeout=2)
+    return WS_CLIENT
+
+
+def safe_api_get(path: str, timeout: float = 3.0) -> dict[str, Any] | None:
+    try:
+        response = requests.get(f"{API_BASE_URL}{path}", timeout=timeout)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        return None
+    return None
+
+
+def safe_api_post(path: str, json_payload: dict[str, Any] | None = None, timeout: float = 3.0) -> bool:
+    try:
+        response = requests.post(f"{API_BASE_URL}{path}", json=json_payload, timeout=timeout)
+        return response.status_code < 400
+    except Exception:
+        return False
+
+
+def infer_faces(frame_bgr: np.ndarray, infer_max_width: int = 1280) -> list[dict[str, Any]]:
+    global LAST_INFER_ERROR
+    LAST_INFER_ERROR = ""
+
+    orig_h, orig_w = frame_bgr.shape[:2]
+
+    if orig_w > infer_max_width:
+        scale = infer_max_width / orig_w
+        infer_w = infer_max_width
+        infer_h = round(orig_h * scale)
+        small_frame = cv2.resize(frame_bgr, (infer_w, infer_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        scale = 1.0
+        small_frame = frame_bgr
+
+    ret, buf = cv2.imencode(".jpg", small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    if not ret:
+        return []
+
+    data: Any = None
+    for _ in range(2):
         try:
-            r = requests.get(f"{API_BASE_URL}/models")
-            if r.status_code == 200:
-                models = r.json().get("models", [])
-                self.det_combo.addItems([m for m in models if "det" in m or "yolo" in m or "scrfd" in m])
-                self.rec_combo.addItems([m for m in models if "w600k" in m or "arcface" in m or "glint" in m])
-                
-                # Defaults if filtering fails
-                if self.det_combo.count() == 0:
-                    self.det_combo.addItems(models)
-                if self.rec_combo.count() == 0:
-                    self.rec_combo.addItems(models)
-        except Exception as e:
-            print(f"Failed to load models: {e}")
-
-    def load_settings(self):
-        try:
-            r = requests.get(f"{API_BASE_URL}/settings")
-            if r.status_code == 200:
-                data = r.json()
-                self.sim_thresh_input.setText(str(data.get("similarity_thresh", 0.4)))
-                self.conf_thresh_input.setText(str(data.get("confidence_thresh", 0.5)))
-                self.unknown_debounce_sec_input.setText(str(data.get("unknown_debounce_sec", 5)))
-                self.known_debounce_min_input.setText(str(data.get("known_debounce_min", 5)))
-                
-                dv = data.get("det_weight", "").split("/")[-1]
-                rv = data.get("rec_weight", "").split("/")[-1]
-                
-                if dv:
-                    idx = self.det_combo.findText(dv)
-                    if idx >= 0: self.det_combo.setCurrentIndex(idx)
-                if rv:
-                    idx = self.rec_combo.findText(rv)
-                    if idx >= 0: self.rec_combo.setCurrentIndex(idx)
-        except Exception as e:
-            print(f"Failed to load settings: {e}")
-
-    def force_update_db(self):
-        try:
-            r = requests.post(f"{API_BASE_URL}/database/update")
-            if r.status_code == 200:
-                QMessageBox.information(self, "Success", "Database updated successfully!")
-            else:
-                QMessageBox.warning(self, "Error", f"Failed to update DB: {r.text}")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to connect: {e}")
-
-    def apply_settings(self):
-        payload = {
-            "det_weight": f"./weights/{self.det_combo.currentText()}" if self.det_combo.currentText() else None,
-            "rec_weight": f"./weights/{self.rec_combo.currentText()}" if self.rec_combo.currentText() else None,
-            "confidence_thresh": float(self.conf_thresh_input.text() or 0.5),
-            "similarity_thresh": float(self.sim_thresh_input.text() or 0.4),
-            "unknown_debounce_sec": int(self.unknown_debounce_sec_input.text() or 5),
-            "known_debounce_min": int(self.known_debounce_min_input.text() or 5),
-        }
-        try:
-            requests.post(f"{API_BASE_URL}/settings", json=payload)
-        except Exception as e:
-            print(f"Error applying settings: {e}")
-            
-    def accept(self):
-        self.apply_settings()
-        super().accept()
-
-
-class InferenceWorker(QThread):
-    result_signal = pyqtSignal(np.ndarray, list, float)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, ws_url=WS_URL):
-        super().__init__()
-        self.ws_url = ws_url
-        self.running = True
-        self.frame_queue = []
-        
-    # Kích thước tối đa gửi lên API (giảm băng thông, tăng tốc độ)
-    INFER_MAX_WIDTH = 1280
-
-    def add_frame(self, frame):
-        # Only keep the absolute latest frame to avoid latency lag on high-res RTSP
-        self.frame_queue = [frame]
-
-    def run(self):
-        asyncio.run(self.ws_loop())
-        
-    async def ws_loop(self):
-        last_time = time.time()
-        while self.running:
-            try:
-                async with websockets.connect(self.ws_url) as ws:
-                    self.error_signal.emit("WS Connected")
-                    while self.running:
-                        if self.frame_queue:
-                            frame = self.frame_queue.pop(0)
-                            
-                            # Cal FPS
-                            curr_time = time.time()
-                            fps = 1.0 / (curr_time - last_time) if (curr_time - last_time) > 0 else 0
-                            last_time = curr_time
-                            
-                            # Resize frame trước khi gửi để giảm dung lượng
-                            orig_h, orig_w = frame.shape[:2]
-                            if orig_w > self.INFER_MAX_WIDTH:
-                                scale = self.INFER_MAX_WIDTH / orig_w
-                                infer_w = self.INFER_MAX_WIDTH
-                                infer_h = round(orig_h * scale)
-                                small_frame = cv2.resize(frame, (infer_w, infer_h), interpolation=cv2.INTER_LINEAR)
-                            else:
-                                scale = 1.0
-                                small_frame = frame
-                            
-                            # Encode JPEG quality 70 – đủ cho nhận diện khuôn mặt, nhỏ hơn nhiều
-                            ret, buffer = cv2.imencode('.jpg', small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                            if not ret:
-                                continue
-                            
-                            await ws.send(buffer.tobytes())
-                            response = await ws.recv()
-                            data = json.loads(response)
-                            
-                            if "error" in data:
-                                self.error_signal.emit(data["error"])
-                            elif "results" in data:
-                                # Scale bbox về kích thước frame gốc nếu đã resize
-                                if scale != 1.0:
-                                    inv = 1.0 / scale
-                                    for face in data["results"]:
-                                        face["bbox"] = [int(v * inv) for v in face["bbox"]]
-                                self.result_signal.emit(frame, data["results"], fps)
-                        else:
-                            await asyncio.sleep(0.01)
-            except Exception as e:
-                self.error_signal.emit(f"WS Error: {e}")
-                await asyncio.sleep(1)
-
-    def stop(self):
-        self.running = False
-        self.wait()
-
-
-class CameraWorker(QThread):
-    new_frame_signal = pyqtSignal(np.ndarray)
-    
-    def __init__(self, source="0"):
-        super().__init__()
-        if str(source).isdigit():
-            self.source = int(source)
-        else:
-            self.source = source
-        self.running = True
-        self._cap = None
-        self._frame = None
-        self._ret = False
-        self._lock = threading.Lock()
-        self._reader_stop = True
-        
-    def _reader_loop(self):
-        while not self._reader_stop:
-            try:
-                if self._cap and self._cap.isOpened():
-                    ret, frame = self._cap.read()
-                    with self._lock:
-                        self._ret = ret
-                        self._frame = frame
-                else:
-                    time.sleep(0.1)
-            except Exception:
-                if self._reader_stop:
-                    break
-                time.sleep(0.1)
-
-    def _read(self):
-        with self._lock:
-            return self._ret, self._frame.copy() if self._frame is not None else None
-
-    def run(self):
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-        if isinstance(self.source, str) and self.source.startswith("rtsp"):
-            self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
-            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        else:
-            self._cap = cv2.VideoCapture(self.source)
-            
-        if not self._cap.isOpened():
-            print("Camera failed to read frame.")
-            return
-            
-        self._reader_stop = False
-        t = threading.Thread(target=self._reader_loop, daemon=True)
-        t.start()
-        time.sleep(0.5)
-
-        while self.running:
-            ret, frame = self._read()
-            if ret and frame is not None:
-                self.new_frame_signal.emit(frame)
-            time.sleep(1/30.0)
-
-        self._reader_stop = True
-        time.sleep(0.2)
-        if self._cap:
-            self._cap.release()
-        
-    def stop(self):
-        self.running = False
-        self.wait()
-
-
-class FaceItemWidget(QWidget):
-    def __init__(self, face_img_rgb, name, time_str, similarity=None, is_unknown=False):
-        super().__init__()
-        
-        layout = QHBoxLayout(self) if not is_unknown else QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        if is_unknown:
-            self.setFixedSize(100, 120)
-            
-            # Live Image
-            h, w, c = face_img_rgb.shape
-            qimg = QImage(face_img_rgb.data.tobytes(), w, h, w * c, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg).scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            img_lbl = QLabel()
-            img_lbl.setPixmap(pixmap)
-            img_lbl.setFixedSize(60, 60)
-            img_lbl.setStyleSheet("border-radius: 5px; border: 1px solid #ccc;")
-            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(img_lbl)
-            
-            # Info
-            info_layout = QVBoxLayout()
-            name_lbl = QLabel(name)
-            name_lbl.setStyleSheet("font-weight: bold; font-size: 10pt; color: red;")
-            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            time_lbl = QLabel(f"Time: {time_str}")
-            time_lbl.setStyleSheet("font-size: 8pt; color: #666;")
-            time_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
-            info_layout.addWidget(name_lbl)
-            info_layout.addWidget(time_lbl)
-            layout.addLayout(info_layout)
-        else:
-            self.setFixedSize(300, 80)
-            
-            images_layout = QHBoxLayout()
-            images_layout.setSpacing(5)
-            
-            # Reference DB Image
-            ref_lbl = QLabel()
-            ref_lbl.setFixedSize(60, 60)
-            ref_lbl.setStyleSheet("border-radius: 5px; border: 1px solid #777;")
-            try:
-                # Load from API
-                url = f"http://localhost:8000/faces/{name}.jpg"
-                res = requests.get(url, timeout=1)
-                if res.status_code == 200:
-                    ref_qimg = QImage()
-                    ref_qimg.loadFromData(res.content)
-                    ref_pix = QPixmap.fromImage(ref_qimg).scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                    ref_lbl.setPixmap(ref_pix)
-                else:
-                    ref_lbl.setText("No DB\nIMG")
-                    ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            except:
-                ref_lbl.setText("Error")
-                ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                
-            images_layout.addWidget(ref_lbl)
-            
-            # Live Frame Image
-            h, w, c = face_img_rgb.shape
-            live_qimg = QImage(face_img_rgb.data.tobytes(), w, h, w * c, QImage.Format.Format_RGB888)
-            live_pix = QPixmap.fromImage(live_qimg).scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            live_lbl = QLabel()
-            live_lbl.setPixmap(live_pix)
-            live_lbl.setFixedSize(40, 40)
-            live_lbl.setStyleSheet("border-radius: 3px; border: 1px solid #ccc;")
-            
-            # Align live image to bottom of the reference image
-            live_container = QVBoxLayout()
-            live_container.addStretch()
-            live_container.addWidget(live_lbl)
-            images_layout.addLayout(live_container)
-            
-            layout.addLayout(images_layout)
-            
-            # Info
-            info_layout = QVBoxLayout()
-            name_lbl = QLabel(name)
-            name_lbl.setStyleSheet("font-weight: bold; font-size: 11pt; color: #333;")
-            time_lbl = QLabel(f"Time: {time_str}")
-            time_lbl.setStyleSheet("font-size: 8pt; color: #666;")
-            
-            info_layout.addWidget(name_lbl)
-            if similarity is not None:
-                sim_lbl = QLabel(f"Sim: {similarity:.2f}")
-                sim_lbl.setStyleSheet("font-size: 8pt; color: #666;")
-                info_layout.addWidget(sim_lbl)
-            info_layout.addWidget(time_lbl)
-            info_layout.addStretch()
-            
-            layout.addLayout(info_layout)
-            
-        self.setStyleSheet("""
-            FaceItemWidget {
-                background-color: white;
-                border-radius: 8px;
-                border: 1px solid #ddd;
-            }
-            FaceItemWidget:hover {
-                background-color: #f0f8ff;
-                border-color: #87cefa;
-            }
-        """)
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("FaceID Management System")
-        self.setGeometry(100, 100, 1280, 800)
-        
-        self.camera_source = "0"
-        self.known_faces_history = {} # name: last_seen timestamp
-        self.last_unknown_seen = 0 # last_seen timestamp
-        self.is_running = False
-        
-        self.setup_ui()
-        
-        self.unknown_debounce_sec = 5
-        self.known_debounce_min = 1
-        
-        # Load settings specifically for local use in GUI debounce
-        self.fetch_local_settings()
-        
-        self.infer_worker = InferenceWorker()
-        self.infer_worker.result_signal.connect(self.on_inference_result)
-        self.infer_worker.error_signal.connect(self.on_ws_error)
-        self.infer_worker.start()
-        
-        self.camera_worker = None
-        # App does not auto-start; user must press Start
-
-    def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-        
-        # Header
-        header = QFrame()
-        header.setStyleSheet("background-color: #385723; color: white;")
-        header.setFixedHeight(50)
-        header_layout = QHBoxLayout(header)
-        title = QLabel("FACE ID")
-        title.setStyleSheet("font-size: 16pt; font-weight: bold; letter-spacing: 2px;")
-        
-        _btn_style = """
-            QPushButton {
-                background-color: transparent; border: 1px solid white; color: white;
-                padding: 5px 15px; border-radius: 3px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: rgba(255,255,255,0.2); }
-        """
-        self.start_btn = QPushButton("▶  Start")
-        self.start_btn.setStyleSheet(_btn_style)
-        self.start_btn.clicked.connect(self.start_pipeline)
-
-        self.stop_btn = QPushButton("■  Stop")
-        self.stop_btn.setStyleSheet(_btn_style.replace(
-            "background-color: transparent", "background-color: #c0392b"
-        ))
-        self.stop_btn.clicked.connect(self.stop_pipeline)
-        self.stop_btn.setEnabled(False)
-
-        settings_btn = QPushButton("⚙ Settings")
-        settings_btn.setStyleSheet(_btn_style)
-        settings_btn.clicked.connect(self.open_settings)
-        
-        header_layout.addWidget(title)
-        header_layout.addStretch()
-        header_layout.addWidget(self.start_btn)
-        header_layout.addWidget(self.stop_btn)
-        header_layout.addWidget(settings_btn)
-        main_layout.addWidget(header)
-        
-        # Content Splitter
-        content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(content_splitter)
-        
-        # Left Panel (Video + Unknown)
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        
-        self.video_label = QLabel()
-        self.video_label.setStyleSheet("background-color: white;")
-        self.video_label.setMinimumSize(640, 480)
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        left_layout.addWidget(self.video_label, stretch=1)
-        
-        # Unknown List Horizontal
-        unknown_group = QGroupBox("Unknown List")
-        unknown_group.setFixedHeight(180)
-        unknown_layout = QHBoxLayout(unknown_group)
-        
-        self.unknown_scroll = QScrollArea()
-        self.unknown_scroll.setWidgetResizable(True)
-        self.unknown_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.unknown_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        
-        self.unknown_container = QWidget()
-        self.unknown_container_layout = QHBoxLayout(self.unknown_container)
-        self.unknown_container_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.unknown_scroll.setWidget(self.unknown_container)
-        
-        unknown_layout.addWidget(self.unknown_scroll)
-        left_layout.addWidget(unknown_group)
-        
-        content_splitter.addWidget(left_panel)
-        
-        # Right Panel (Attendance)
-        right_panel = QGroupBox("Attendance List")
-        right_panel.setFixedWidth(340)
-        right_panel.setStyleSheet("QGroupBox { font-weight: bold; }")
-        right_layout = QVBoxLayout(right_panel)
-        
-        self.attendance_scroll = QScrollArea()
-        self.attendance_scroll.setWidgetResizable(True)
-        self.attendance_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        
-        self.attendance_container = QWidget()
-        self.attendance_container_layout = QVBoxLayout(self.attendance_container)
-        self.attendance_container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.attendance_scroll.setWidget(self.attendance_container)
-        
-        right_layout.addWidget(self.attendance_scroll)
-        content_splitter.addWidget(right_panel)
-        
-        # Set Splitter ratio
-        content_splitter.setSizes([900, 280])
-
-    def fetch_local_settings(self):
-        try:
-            r = requests.get(f"{API_BASE_URL}/settings")
-            if r.status_code == 200:
-                data = r.json()
-                self.unknown_debounce_sec = data.get("unknown_debounce_sec", 5)
-                self.known_debounce_min = data.get("known_debounce_min", 1)
-        except:
-            pass
-
-    def start_pipeline(self):
-        """Start camera + inference pipeline."""
-        if self.is_running:
-            return
-        self.is_running = True
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        # Notify API
-        try:
-            requests.post(f"{API_BASE_URL}/infer/start", timeout=2)
+            ws = get_ws_client()
+            ws.send(buf.tobytes())
+            data = json.loads(ws.recv())
+            break
         except Exception:
-            pass
-        # Start camera
-        if self.camera_worker:
-            self.camera_worker.stop()
-        self.camera_worker = CameraWorker(self.camera_source)
-        self.camera_worker.new_frame_signal.connect(self.on_new_frame)
-        self.camera_worker.start()
+            close_ws_client()
 
-    def stop_pipeline(self):
-        """Stop camera + inference pipeline."""
-        if not self.is_running:
-            return
-        self.is_running = False
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        # Notify API
-        try:
-            requests.post(f"{API_BASE_URL}/infer/stop", timeout=2)
-        except Exception:
-            pass
-        # Stop camera
-        if self.camera_worker:
-            self.camera_worker.stop()
-            self.camera_worker = None
-        # Clear video display
-        self.video_label.clear()
-        self.video_label.setStyleSheet("background-color: #111; color: #aaa;")
-        self.video_label.setText("⏹  Stopped — press  ▶ Start  to begin")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    if data is None:
+        LAST_INFER_ERROR = "Khong ket noi duoc websocket infer"
+        return []
 
-    def start_camera(self):
-        """Legacy helper — delegates to start_pipeline."""
-        self.start_pipeline()
+    if isinstance(data, dict) and data.get("error"):
+        LAST_INFER_ERROR = str(data.get("error"))
+        return []
 
-    def on_new_frame(self, frame):
-        # We send it to backend
-        self.infer_worker.add_frame(frame)
-
-    def on_ws_error(self, err):
-        # Print warning to console instead of showing on UI
-        print(f"WS Status: {err}")
-        
-    def crop_face(self, frame, bbox):
-        x1, y1, x2, y2 = bbox
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-        return frame[y1:y2, x1:x2]
-
-    def on_inference_result(self, frame_bgr, results, fps):
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        
-        # Draw FPS
-        cv2.putText(frame_rgb, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        
-        # Draw Results
+    results = data.get("results", []) if isinstance(data, dict) else []
+    if scale != 1.0:
+        inv = 1.0 / scale
         for face in results:
-            bbox = face["bbox"]
-            name = face["name"]
-            sim = face.get("similarity", 0.0)
-            
-            color = (0, 255, 0) if name != "Unknown" else (255, 0, 0)
-            
-            # Draw bbox natively with opencv on the copy
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame_rgb, f"{name} {sim:.2f}", (x1, max(0, y1 - 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            
-            time_str = datetime.datetime.now().strftime("%H:%M:%S")
-            current_time = time.time()
-            
-            # Add to lists
-            if name == "Unknown":
-                if current_time - self.last_unknown_seen > self.unknown_debounce_sec:
-                    face_img = self.crop_face(frame_rgb, bbox)
-                    if face_img.size > 0:
-                        self.last_unknown_seen = current_time
-                        widget = FaceItemWidget(face_img, "Unknown", time_str, is_unknown=True)
-                        self.unknown_container_layout.insertWidget(0, widget)
-                        # Encode face NOW (main thread) then log in background
-                        face_bytes = self._encode_face(face_img)
-                        threading.Thread(target=self._log_unknown, args=(face_bytes,), daemon=True).start()
-                        # Cleanup old
-                        if self.unknown_container_layout.count() > 30:
-                            item = self.unknown_container_layout.takeAt(self.unknown_container_layout.count() - 1)
-                            if item and item.widget():
-                                item.widget().deleteLater()
-            else:
-                last_seen = self.known_faces_history.get(name, 0)
-                if current_time - last_seen > (self.known_debounce_min * 60):
-                    self.known_faces_history[name] = current_time
-                    face_img = self.crop_face(frame_rgb, bbox)
-                    if face_img.size > 0:
-                        widget = FaceItemWidget(face_img, name, time_str, similarity=sim, is_unknown=False)
-                        self.attendance_container_layout.insertWidget(0, widget)
-                        # Encode face NOW (main thread) then log in background
-                        face_bytes = self._encode_face(face_img)
-                        threading.Thread(target=self._log_attendance, args=(name, sim, face_bytes), daemon=True).start()
+            face["bbox"] = [int(v * inv) for v in face.get("bbox", [])]
+    return results
 
-        # Show frame
-        h, w, c = frame_rgb.shape
-        qimg = QImage(frame_rgb.data.tobytes(), w, h, w * c, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg).scaled(
-            self.video_label.width(), self.video_label.height(),
-            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        )
-        self.video_label.setPixmap(pixmap)
 
-    @staticmethod
-    def _encode_face(face_img_rgb: np.ndarray) -> bytes | None:
-        """Encode RGB face crop to JPEG bytes (convert to BGR first)."""
+def crop_face(frame_rgb: np.ndarray, bbox: list[int]) -> np.ndarray:
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame_rgb.shape[1], x2), min(frame_rgb.shape[0], y2)
+    return frame_rgb[y1:y2, x1:x2]
+
+
+def encode_face(face_img_rgb: np.ndarray) -> bytes | None:
+    try:
+        face_bgr = cv2.cvtColor(face_img_rgb, cv2.COLOR_RGB2BGR)
+        ret, buf = cv2.imencode(".jpg", face_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        return buf.tobytes() if ret else None
+    except Exception:
+        return None
+
+
+def coerce_frame_to_rgb_array(frame: Any) -> np.ndarray | None:
+    if frame is None:
+        return None
+
+    if isinstance(frame, np.ndarray):
+        arr = frame
+    elif isinstance(frame, dict):
+        frame_path = frame.get("path")
+        if not frame_path:
+            return None
+        img_bgr = cv2.imread(str(Path(str(frame_path))))
+        if img_bgr is None:
+            return None
+        arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    else:
         try:
-            face_bgr = cv2.cvtColor(face_img_rgb, cv2.COLOR_RGB2BGR)
-            ret, buf = cv2.imencode('.jpg', face_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            return buf.tobytes() if ret else None
+            arr = np.asarray(frame)
         except Exception:
             return None
 
-    def _log_attendance(self, name: str, similarity: float, face_bytes: bytes | None = None):
-        try:
-            files = {'image': ('face.jpg', face_bytes, 'image/jpeg')} if face_bytes else {}
-            data = {'name': name, 'similarity': str(float(similarity))}
-            requests.post(f"{API_BASE_URL}/attendance/log", data=data, files=files, timeout=5)
-        except Exception:
-            pass
+    if arr.size == 0:
+        return None
 
-    def _log_unknown(self, face_bytes: bytes | None = None):
-        try:
-            files = {'image': ('face.jpg', face_bytes, 'image/jpeg')} if face_bytes else {}
-            requests.post(f"{API_BASE_URL}/unknown/log", files=files, timeout=5)
-        except Exception:
-            pass
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        pass
+    else:
+        return None
 
-    def open_settings(self):
-        self.fetch_local_settings()
-        dlg = SettingsDialog(self)
-        dlg.source_input.setText(str(self.camera_source))
-        if dlg.exec():
+    return np.ascontiguousarray(arr)
+
+
+def log_attendance(name: str, similarity: float, face_bytes: bytes | None = None) -> None:
+    try:
+        files = {"image": ("face.jpg", io.BytesIO(face_bytes), "image/jpeg")} if face_bytes else {}
+        data = {"name": name, "similarity": str(float(similarity))}
+        requests.post(f"{API_BASE_URL}/attendance/log", data=data, files=files, timeout=5)
+    except Exception:
+        pass
+
+
+def log_unknown(face_bytes: bytes | None = None) -> None:
+    try:
+        files = {"image": ("face.jpg", io.BytesIO(face_bytes), "image/jpeg")} if face_bytes else {}
+        requests.post(f"{API_BASE_URL}/unknown/log", files=files, timeout=5)
+    except Exception:
+        pass
+
+
+def render_unknown_html(items: list[dict[str, Any]]) -> str:
+    cards = []
+    for item in items:
+        cards.append(
+            (
+                '<div class="face-card unknown">'
+                f'<img src="data:image/jpeg;base64,{item["image"]}" alt="unknown" />'
+                f'<div class="meta">Unknown<br/><span>{item["time"]}</span></div>'
+                "</div>"
+            )
+        )
+    return '<div class="face-strip">' + "".join(cards) + "</div>"
+
+
+def render_attendance_html(items: list[dict[str, Any]]) -> str:
+    cards = []
+    for item in items:
+        db_image = f"{FACE_BASE_URL}/{item['name']}.jpg"
+        cards.append(
+            (
+                '<div class="att-card">'
+                f'<img class="db" src="{db_image}" alt="{item["name"]}" onerror="this.style.opacity=0.3" />'
+                f'<img class="live" src="data:image/jpeg;base64,{item["image"]}" alt="live" />'
+                '<div class="meta">'
+                f'<div class="name">{item["name"]}</div>'
+                f'<div class="sim">Sim: {item["similarity"]:.2f}</div>'
+                f'<div class="time">{item["time"]}</div>'
+                "</div>"
+                "</div>"
+            )
+        )
+    return '<div class="att-list">' + "".join(cards) + "</div>"
+
+
+@dataclass
+class PipelineState:
+    camera_source: str = "0"
+    running: bool = False
+    cap: cv2.VideoCapture | None = None
+    known_faces_history: dict[str, float] = field(default_factory=dict)
+    last_unknown_seen: float = 0.0
+    unknown_debounce_sec: int = 5
+    known_debounce_min: int = 1
+    unknown_items: list[dict[str, Any]] = field(default_factory=list)
+    attendance_items: list[dict[str, Any]] = field(default_factory=list)
+    last_tick: float = field(default_factory=time.time)
+    use_browser_webcam: bool = False
+    backend_infer_running: bool = False
+    latest_frame_rgb: np.ndarray | None = None
+    last_status_text: str = "Dung"
+    last_infer_time: float = 0.0
+    min_infer_interval_sec: float = 0.11
+
+    def _ensure_backend_started(self) -> None:
+        if not self.backend_infer_running:
+            if safe_api_post("/infer/start"):
+                self.backend_infer_running = True
+
+    def _ensure_backend_stopped(self) -> None:
+        if self.backend_infer_running:
+            if safe_api_post("/infer/stop"):
+                self.backend_infer_running = False
+
+    def fetch_local_settings(self) -> None:
+        data = safe_api_get("/settings")
+        if not data:
+            return
+        self.unknown_debounce_sec = int(data.get("unknown_debounce_sec", 5))
+        self.known_debounce_min = int(data.get("known_debounce_min", 1))
+
+    def start(self, source: str) -> str:
+        self.stop()
+        self.camera_source = str(source or "0")
+
+        if RUNNING_IN_DOCKER and self.camera_source.isdigit():
+            self.running = True
+            self.use_browser_webcam = True
             self.fetch_local_settings()
-            new_source = dlg.source_input.text()
-            if new_source != str(self.camera_source):
-                self.camera_source = new_source
-                # Only restart the camera if pipeline is currently running
-                if self.is_running:
-                    if self.camera_worker:
-                        self.camera_worker.stop()
-                    self.camera_worker = CameraWorker(self.camera_source)
-                    self.camera_worker.new_frame_signal.connect(self.on_new_frame)
-                    self.camera_worker.start()
+            self._ensure_backend_started()
+            self.last_status_text = "Dang chay bang browser webcam mode (full Docker)"
+            return self.last_status_text
 
-    def closeEvent(self, event):
-        if self.is_running:
-            try:
-                requests.post(f"{API_BASE_URL}/infer/stop", timeout=1)
-            except Exception:
-                pass
-        self.infer_worker.stop()
-        if self.camera_worker:
-            self.camera_worker.stop()
-        super().closeEvent(event)
+        src: int | str = int(self.camera_source) if self.camera_source.isdigit() else self.camera_source
+        self.use_browser_webcam = False
+
+        if isinstance(src, str) and src.startswith("rtsp"):
+            import os
+
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            self.cap = cv2.VideoCapture(src)
+
+        if not self.cap or not self.cap.isOpened():
+            self.cap = None
+            self.running = False
+            return "Khong mo duoc camera/video source"
+
+        self.running = True
+        self.fetch_local_settings()
+        self._ensure_backend_started()
+        self.last_status_text = "Dang chay"
+        return self.last_status_text
+
+    def stop(self) -> None:
+        self.running = False
+        self.use_browser_webcam = False
+        self._ensure_backend_stopped()
+        self.latest_frame_rgb = None
+        self.last_status_text = "Da dung"
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+    def _process_inference_frame(self, frame_rgb: np.ndarray, source_label: str) -> tuple[np.ndarray, str, str, str]:
+        # Gradio webcam frames can be readonly; OpenCV drawing APIs require writable arrays.
+        frame_rgb = np.ascontiguousarray(frame_rgb.copy())
+
+        now = time.time()
+        dt = max(now - self.last_tick, 1e-6)
+        fps = 1.0 / dt
+        self.last_tick = now
+
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        results = infer_faces(frame_bgr)
+
+        for face in results:
+            bbox = face.get("bbox", [0, 0, 0, 0])
+            name = face.get("name", "Unknown")
+            similarity = float(face.get("similarity", 0.0))
+
+            color = (0, 255, 0) if name != "Unknown" else (255, 0, 0)
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                frame_rgb,
+                f"{name} {similarity:.2f}",
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+            )
+
+            face_img = crop_face(frame_rgb, bbox)
+            if face_img.size == 0:
+                continue
+
+            face_bytes = encode_face(face_img)
+            if face_bytes is None:
+                continue
+
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+
+            if name == "Unknown":
+                if now - self.last_unknown_seen > self.unknown_debounce_sec:
+                    self.last_unknown_seen = now
+                    b64_img = base64_encode(face_bytes)
+                    self.unknown_items.insert(0, {"image": b64_img, "time": now_str})
+                    self.unknown_items = self.unknown_items[:30]
+                    log_unknown(face_bytes)
+            else:
+                last_seen = self.known_faces_history.get(name, 0)
+                if now - last_seen > self.known_debounce_min * 60:
+                    self.known_faces_history[name] = now
+                    b64_img = base64_encode(face_bytes)
+                    self.attendance_items.insert(
+                        0,
+                        {
+                            "name": name,
+                            "similarity": similarity,
+                            "time": now_str,
+                            "image": b64_img,
+                        },
+                    )
+                    self.attendance_items = self.attendance_items[:100]
+                    log_attendance(name, similarity, face_bytes)
+
+        cv2.putText(frame_rgb, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        self.latest_frame_rgb = frame_rgb.copy()
+
+        status = f"Dang chay | FPS: {fps:.1f} | Source: {source_label}"
+        if LAST_INFER_ERROR:
+            status = f"{status} | InferErr: {LAST_INFER_ERROR}"
+        self.last_status_text = status
+
+        return (
+            frame_rgb,
+            render_attendance_html(self.attendance_items),
+            render_unknown_html(self.unknown_items),
+            status,
+        )
+
+    def process_browser_webcam_frame(self, frame_rgb: np.ndarray | None) -> tuple[np.ndarray, str, str, str]:
+        frame_ready = coerce_frame_to_rgb_array(frame_rgb)
+
+        if RUNNING_IN_DOCKER and frame_ready is not None and (not self.running or not self.use_browser_webcam):
+            self.running = True
+            self.use_browser_webcam = True
+            self.fetch_local_settings()
+            self._ensure_backend_started()
+
+        if not self.running or not self.use_browser_webcam:
+            return self.process_frame()
+
+        if frame_ready is None:
+            if self.latest_frame_rgb is not None:
+                return (
+                    self.latest_frame_rgb,
+                    render_attendance_html(self.attendance_items),
+                    render_unknown_html(self.unknown_items),
+                    self.last_status_text,
+                )
+
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(
+                placeholder,
+                "Dang cho webcam frame tu browser...",
+                (30, 245),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (220, 220, 220),
+                2,
+            )
+            frame_out = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+            self.last_status_text = "Dang cho webcam frame tu browser..."
+            return (
+                frame_out,
+                render_attendance_html(self.attendance_items),
+                render_unknown_html(self.unknown_items),
+                self.last_status_text,
+            )
+
+        now = time.time()
+        if now - self.last_infer_time >= self.min_infer_interval_sec:
+            self.last_infer_time = now
+            return self._process_inference_frame(frame_ready, "browser-webcam")
+
+        # Keep stream visually continuous between inference frames.
+        frame_out = np.ascontiguousarray(frame_ready.copy())
+        dt = max(now - self.last_tick, 1e-6)
+        fps = 1.0 / dt
+        self.last_tick = now
+        cv2.putText(frame_out, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        self.latest_frame_rgb = frame_out.copy()
+        self.last_status_text = f"Dang chay | FPS: {fps:.1f} | Source: browser-webcam"
+        return (
+            frame_out,
+            render_attendance_html(self.attendance_items),
+            render_unknown_html(self.unknown_items),
+            self.last_status_text,
+        )
+
+    def process_frame(self) -> tuple[np.ndarray, str, str, str]:
+        if self.running and self.use_browser_webcam:
+            if self.latest_frame_rgb is not None:
+                return (
+                    self.latest_frame_rgb,
+                    render_attendance_html(self.attendance_items),
+                    render_unknown_html(self.unknown_items),
+                    self.last_status_text,
+                )
+
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(
+                placeholder,
+                "Browser webcam mode active",
+                (40, 220),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (220, 220, 220),
+                2,
+            )
+            cv2.putText(
+                placeholder,
+                "Allow webcam and keep camera panel on",
+                (25, 260),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (190, 190, 190),
+                1,
+            )
+            frame_rgb = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+            self.last_status_text = "Dang cho webcam frame tu browser..."
+            return frame_rgb, render_attendance_html(self.attendance_items), render_unknown_html(self.unknown_items), self.last_status_text
+
+        if not self.running or self.cap is None:
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(
+                placeholder,
+                "Stopped - Press Start",
+                (40, 240),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (220, 220, 220),
+                2,
+            )
+            frame_rgb = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+            self.last_status_text = "Dung"
+            return frame_rgb, render_attendance_html(self.attendance_items), render_unknown_html(self.unknown_items), self.last_status_text
+
+        ret, frame_bgr = self.cap.read()
+        if not ret or frame_bgr is None:
+            self.stop()
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "End of stream", (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (220, 220, 220), 2)
+            frame_rgb = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+            self.last_status_text = "Het luong video"
+            return frame_rgb, render_attendance_html(self.attendance_items), render_unknown_html(self.unknown_items), self.last_status_text
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        return self._process_inference_frame(frame_rgb, self.camera_source)
+
+
+def base64_encode(image_bytes: bytes) -> str:
+    import base64
+
+    return base64.b64encode(image_bytes).decode("ascii")
+
+
+def get_models_and_settings() -> tuple[list[str], list[str], dict[str, Any]]:
+    models = safe_api_get("/models") or {"models": []}
+    settings = safe_api_get("/settings") or {}
+
+    model_list = models.get("models", [])
+    det_choices = [m for m in model_list if "det" in m or "yolo" in m or "scrfd" in m] or model_list
+    rec_choices = [m for m in model_list if "w600k" in m or "arcface" in m or "glint" in m] or model_list
+    return det_choices, rec_choices, settings
+
+
+def refresh_settings_ui() -> tuple[Any, Any, float, float, int, int, str]:
+    det_choices, rec_choices, settings = get_models_and_settings()
+
+    det_value = (settings.get("det_weight", "").split("/")[-1] if settings else "")
+    rec_value = (settings.get("rec_weight", "").split("/")[-1] if settings else "")
+    sim = float(settings.get("similarity_thresh", 0.4))
+    conf = float(settings.get("confidence_thresh", 0.5))
+    unknown_sec = int(settings.get("unknown_debounce_sec", 5))
+    known_min = int(settings.get("known_debounce_min", 1))
+
+    return (
+        gr.update(choices=det_choices, value=det_value if det_value in det_choices else None),
+        gr.update(choices=rec_choices, value=rec_value if rec_value in rec_choices else None),
+        sim,
+        conf,
+        unknown_sec,
+        known_min,
+        "Da tai setting tu backend",
+    )
+
+
+def apply_settings(
+    det_model: str | None,
+    rec_model: str | None,
+    sim_thresh: float,
+    conf_thresh: float,
+    unknown_sec: int,
+    known_min: int,
+    state: PipelineState,
+) -> tuple[str, PipelineState]:
+    payload = {
+        "det_weight": f"./weights/{det_model}" if det_model else None,
+        "rec_weight": f"./weights/{rec_model}" if rec_model else None,
+        "similarity_thresh": float(sim_thresh),
+        "confidence_thresh": float(conf_thresh),
+        "unknown_debounce_sec": int(unknown_sec),
+        "known_debounce_min": int(known_min),
+    }
+
+    if safe_api_post("/settings", json_payload=payload):
+        state.fetch_local_settings()
+        return "Da cap nhat setting", state
+    return "Khong cap nhat duoc setting", state
+
+
+def force_update_db() -> str:
+    ok = safe_api_post("/database/update")
+    return "Da force update database" if ok else "Force update database that bai"
+
+
+def start_pipeline(source: str, state: PipelineState) -> tuple[str, PipelineState]:
+    status = state.start(source)
+    return status, state
+
+
+def stop_pipeline(state: PipelineState) -> tuple[str, PipelineState]:
+    state.stop()
+    return "Da dung", state
+
+
+def tick(state: PipelineState) -> tuple[np.ndarray, str, str, str, PipelineState]:
+    if state.running and state.use_browser_webcam:
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), state
+    frame, attendance_html, unknown_html, status = state.process_frame()
+    return frame, attendance_html, unknown_html, status, state
+
+
+def make_test_frame(title: str, subtitle: str) -> np.ndarray:
+    canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(canvas, title, (35, 215), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2)
+    cv2.putText(canvas, subtitle, (35, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 180), 1)
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+def initialize_dashboard(state: PipelineState) -> tuple[np.ndarray, str, str, str, PipelineState]:
+    frame, attendance_html, unknown_html, status = state.process_frame()
+    return frame, attendance_html, unknown_html, status, state
+
+
+def render_test_frame(state: PipelineState) -> tuple[np.ndarray, str, PipelineState]:
+    frame = make_test_frame("UI render OK", "Neu ban thay anh nay, frontend da hien thi binh thuong")
+    return frame, "UI render test: OK", state
+
+
+def on_browser_webcam_stream(frame: np.ndarray | None, state: PipelineState) -> tuple[np.ndarray, str, str, str, PipelineState]:
+    if frame is None:
+        print("[frontend] webcam stream callback: frame=None", flush=True)
+    else:
+        print(f"[frontend] webcam stream callback: frame_shape={getattr(frame, 'shape', None)}", flush=True)
+    frame_out, attendance_html, unknown_html, status = state.process_browser_webcam_frame(frame)
+    return frame_out, attendance_html, unknown_html, status, state
+
+
+CSS = """
+.face-strip {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 4px;
+}
+.face-card {
+  min-width: 110px;
+  border: 1px solid #d6d6d6;
+  border-radius: 8px;
+  padding: 6px;
+  background: #ffffff;
+  text-align: center;
+}
+.face-card.unknown .meta { color: #c0392b; font-weight: 600; }
+.face-card img {
+  width: 90px;
+  height: 70px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #ccc;
+}
+.att-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 560px;
+  overflow-y: auto;
+}
+.att-card {
+  display: grid;
+  grid-template-columns: 60px 50px 1fr;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #d6d6d6;
+  border-radius: 8px;
+  padding: 6px;
+  background: #ffffff;
+}
+.att-card img.db, .att-card img.live {
+  width: 100%;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #ccc;
+}
+.att-card .name { font-weight: 700; }
+.att-card .sim, .att-card .time, .face-card .meta span { color: #666; font-size: 12px; }
+"""
+
+
+ACTIVE_STATES: list[PipelineState] = []
+
+
+def register_state(state: PipelineState) -> PipelineState:
+    ACTIVE_STATES.append(state)
+    return state
+
+
+def release_all_cameras() -> None:
+    for state in ACTIVE_STATES:
+        try:
+            state.stop()
+        except Exception:
+            pass
+
+
+def on_session_closed() -> None:
+    release_all_cameras()
+    close_ws_client()
+
+
+def cleanup() -> None:
+    release_all_cameras()
+    close_ws_client()
+
+
+atexit.register(cleanup)
+
+
+def build_ui() -> gr.Blocks:
+    initial_state = PipelineState()
+    initial_state.fetch_local_settings()
+    register_state(initial_state)
+
+    with gr.Blocks(title="FaceID Browser UI") as demo:
+        gr.Markdown("## FaceID Browser Dashboard")
+        state = gr.State(initial_state)
+
+        with gr.Row():
+            source = gr.Textbox(value="0", label="Video Source", placeholder="0, 1, file path, rtsp://...")
+            start_btn = gr.Button("Start", variant="primary")
+            stop_btn = gr.Button("Stop", variant="stop")
+            test_frame_btn = gr.Button("Render Test Frame")
+            status_box = gr.Textbox(value="Dung", label="Status", interactive=False)
+
+        with gr.Accordion("Settings", open=False):
+            with gr.Row():
+                det_model = gr.Dropdown(choices=[], label="Detection Model")
+                rec_model = gr.Dropdown(choices=[], label="Recognition Model")
+            with gr.Row():
+                sim_thresh = gr.Slider(0.1, 1.0, value=0.4, step=0.01, label="Similarity Threshold")
+                conf_thresh = gr.Slider(0.1, 1.0, value=0.5, step=0.01, label="Confidence Threshold")
+            with gr.Row():
+                unknown_sec = gr.Number(value=5, precision=0, label="Unknown Debounce (sec)")
+                known_min = gr.Number(value=1, precision=0, label="Known Debounce (min)")
+            with gr.Row():
+                refresh_btn = gr.Button("Refresh Settings")
+                apply_btn = gr.Button("Apply Settings", variant="primary")
+                update_db_btn = gr.Button("Force Update DB")
+            settings_msg = gr.Textbox(label="Settings Message", interactive=False)
+
+        webcam_input = gr.Image(
+            label="Browser Webcam Input (click camera icon and allow permission)",
+            type="numpy",
+            sources=["webcam"],
+            streaming=True,
+            interactive=True,
+            webcam_options=gr.WebcamOptions(mirror=False),
+        )
+
+        frame_view = gr.Image(
+            label="Live Stream",
+            type="numpy",
+            format="jpeg",
+            interactive=False,
+            value=make_test_frame("FaceID dashboard ready", "Bam Start de chay pipeline hoac Render Test Frame de kiem tra UI"),
+        )
+
+        with gr.Row():
+            unknown_html = gr.HTML(label="Unknown List", value="<div class='face-strip'></div>")
+            attendance_html = gr.HTML(label="Attendance List", value="<div class='att-list'></div>")
+
+        timer = gr.Timer(value=0.12, active=True)
+
+        demo.load(
+            fn=refresh_settings_ui,
+            inputs=None,
+            outputs=[det_model, rec_model, sim_thresh, conf_thresh, unknown_sec, known_min, settings_msg],
+        )
+
+        demo.load(
+            fn=initialize_dashboard,
+            inputs=[state],
+            outputs=[frame_view, attendance_html, unknown_html, status_box, state],
+        )
+
+        refresh_btn.click(
+            fn=refresh_settings_ui,
+            inputs=None,
+            outputs=[det_model, rec_model, sim_thresh, conf_thresh, unknown_sec, known_min, settings_msg],
+        )
+
+        apply_btn.click(
+            fn=apply_settings,
+            inputs=[det_model, rec_model, sim_thresh, conf_thresh, unknown_sec, known_min, state],
+            outputs=[settings_msg, state],
+        )
+
+        update_db_btn.click(fn=force_update_db, inputs=None, outputs=settings_msg)
+
+        start_btn.click(fn=start_pipeline, inputs=[source, state], outputs=[status_box, state])
+        stop_btn.click(fn=stop_pipeline, inputs=[state], outputs=[status_box, state])
+
+        test_frame_btn.click(
+            fn=render_test_frame,
+            inputs=[state],
+            outputs=[frame_view, status_box, state],
+            queue=False,
+        )
+
+        timer.tick(
+            fn=tick,
+            inputs=[state],
+            outputs=[frame_view, attendance_html, unknown_html, status_box, state],
+            queue=False,
+        )
+
+        webcam_input.stream(
+            fn=on_browser_webcam_stream,
+            inputs=[webcam_input, state],
+            outputs=[frame_view, attendance_html, unknown_html, status_box, state],
+            queue=False,
+            trigger_mode="always_last",
+            stream_every=0.11,
+        )
+
+        demo.unload(on_session_closed)
+
+    return demo
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    app = build_ui()
+    app.launch(
+        server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
+        share=False,
+        show_error=True,
+        css=CSS,
+    )

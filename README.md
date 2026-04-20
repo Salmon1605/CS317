@@ -1,110 +1,132 @@
-# Face Re-ID Project Run Guide (Windows)
+# FaceID Browser Project (Windows)
 
-Project source is in [project](project).
+This document explains how to run the FaceID system in full Docker mode, using a browser-based Gradio frontend with a FastAPI backend and PostgreSQL.
 
-## Prerequisites
+## 1) Overview
 
-- Python 3.11 installed (`py -3.11` available)
-- Docker Desktop installed and running
+The stack includes 3 services:
 
----
+- `postgres`: stores settings, attendance logs, and metadata.
+- `app`: FastAPI backend for detection/recognition models and websocket inference.
+- `frontend`: browser UI built with Gradio.
 
-## Model checkpoint
+Default ports:
 
-- Download model checkpoint and create directory weights/
-  | Model | Link | Dung lượng |
-  |-------|------|-----------|
-  | SCRFD 10G (detection) | [det_10g.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_10g.onnx) | 16.1 MB |
-  | SCRFD 500M (nhẹ) | [det_500m.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_500m.onnx) | 2.4 MB |
-  | ArcFace MobileFace | [w600k_mbf.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_mbf.onnx) | 13 MB |
-  | ArcFace ResNet-50 | [w600k_r50.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx) | 166 MB |
+- Frontend: `http://localhost:7860`
+- Backend API: `http://localhost:8000`
+- PostgreSQL: `localhost:5432`
 
----
+## 2) Prerequisites
 
-## Method 1: Use [project/start_all.bat](project/start_all.bat)
+- Docker Desktop installed and running.
+- Python 3.11 is recommended if you want to run scripts locally outside Docker.
+- Model weights available in the `weights/` directory.
 
-### 1) Prepare a venv (one-time setup)
+Reference models:
 
-Run these commands in [project](project):
+| Model              | Link                                                                                                      | Size    |
+| ------------------ | --------------------------------------------------------------------------------------------------------- | ------- |
+| SCRFD 10G          | [det_10g.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_10g.onnx)     | 16.1 MB |
+| SCRFD 500M         | [det_500m.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_500m.onnx)   | 2.4 MB  |
+| ArcFace MobileFace | [w600k_mbf.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_mbf.onnx) | 13 MB   |
+| ArcFace ResNet-50  | [w600k_r50.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx) | 166 MB  |
 
-```powershell
-cd .\project
-py -3.11 -m venv venv311
-.\venv311\Scripts\python.exe -m pip install --upgrade pip
-.\venv311\Scripts\python.exe -m pip install -r .\requirements-gui.txt
-```
+## 3) Quick Start (One Command)
 
-Note: [project/start_all.bat](project/start_all.bat) prefers `venv311`; if it does not exist, it falls back to `venv`.
-
-### 2) Start the full system
-
-```powershell
-cd .\project
-.\start_all.bat
-```
-
-The script will:
-
-- Build and run backend/database with `docker compose up -d`
-- Wait for the backend to become ready
-- Launch the GUI (`gui.py`)
-
-### 3) Stop the system
-
-```powershell
-cd .\project
-.\stop_all.bat
-```
-
----
-
-## Method 2: Do not use [project/start_all.bat](project/start_all.bat)
-
-### 1) Create and install a venv for GUI
-
-```powershell
-cd .\project
-py -3.11 -m venv venv311
-.\venv311\Scripts\python.exe -m pip install --upgrade pip
-.\venv311\Scripts\python.exe -m pip install -r .\requirements-gui.txt
-```
-
-### 2) Start backend with Docker Compose
+From the project folder:
 
 ```powershell
 cd .\project
 docker compose up -d --build
 ```
 
-Quick check:
+Then open the browser UI:
+
+```powershell
+start http://localhost:7860
+```
+
+Check status:
 
 ```powershell
 docker compose ps
 ```
 
-### 3) Run GUI locally
+## 4) Step-by-Step Startup
+
+If you want to start each service separately for easier debugging:
 
 ```powershell
 cd .\project
-.\venv311\Scripts\python.exe .\gui.py
+docker compose build
+docker compose up -d postgres
+docker compose up -d app
+docker compose up -d frontend
 ```
 
-### 4) Stop backend
+Readiness checks:
 
 ```powershell
-cd .\project
+docker compose ps
+Invoke-RestMethod http://localhost:8000/api/infer/status
+Invoke-WebRequest http://localhost:7860
+```
+
+## 5) Using the Browser UI
+
+1. Open `http://localhost:7860`
+2. Allow camera permission in the browser.
+3. In `Video Source`, keep `0` for browser webcam mode.
+4. Click `Start`.
+5. Monitor `Status`, `Live Stream`, `Attendance List`, and `Unknown List`.
+
+## 6) Stop or Reset the System
+
+Stop all services:
+
+```powershell
 docker compose down
 ```
 
----
-
-## Notes
-
-- Backend runs in Docker on port `8000`.
-- GUI runs locally and connects to backend via `http://localhost:8000` and `ws://localhost:8000/ws/infer`.
-- If you want to install the full dependency set for local development (backend + GUI):
+Stop and remove database volume (use with caution):
 
 ```powershell
-cd .\project
-.\venv311\Scripts\python.exe -m pip install -r .\requirements.txt
+docker compose down -v
 ```
+
+## 7) Useful Debug Commands
+
+Live logs:
+
+```powershell
+docker compose logs -f app frontend
+```
+
+Recent logs:
+
+```powershell
+docker compose logs --since 5m frontend
+docker compose logs --since 5m app
+```
+
+Rebuild only frontend after editing `gui.py`:
+
+```powershell
+docker compose up -d --build frontend
+```
+
+## 8) Camera Notes (Windows + Docker)
+
+- In full Docker mode, browser webcam is preferred over direct USB webcam access inside containers.
+- Camera index `0/1` in Docker frontend does not always map correctly to the host webcam.
+- Most stable workflow on Windows: open UI in browser, allow camera permission, keep source `0`, then click `Start`.
+
+## 9) Data Persistence
+
+- `assets/` is mounted into backend container for captures.
+- `database/face_database/` is mounted for face metadata/index files.
+- PostgreSQL uses the `postgres_data` volume.
+
+## 10) Important Note
+
+You cannot auto-open a browser tab directly from `docker compose up -d --build` itself because opening a browser is a host-side action. Open it manually with `start http://localhost:7860`, or use a host script (`.bat`/`.ps1`) to add that step.

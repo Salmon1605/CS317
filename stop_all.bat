@@ -4,10 +4,7 @@ setlocal
 set "PROJECT_DIR=%~dp0"
 pushd "%PROJECT_DIR%"
 
-echo [1/2] Stopping GUI window if running...
-taskkill /FI "WINDOWTITLE eq FaceID GUI*" /T /F >nul 2>nul
-
-echo [2/2] Stopping Docker services...
+echo [1/1] Stopping Docker services...
 docker compose down
 if errorlevel 1 (
   echo Failed to stop Docker services.
@@ -15,6 +12,6 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo Done. GUI and backend stack are stopped.
+echo Done. Full Docker stack is stopped.
 popd
 exit /b 0
